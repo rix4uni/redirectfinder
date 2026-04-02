@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -373,7 +374,27 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 
 		// Get Location header
 		location := resp.Header.Get("Location")
-		hasRedirectDomain := strings.Contains(strings.ToLower(location), strings.ToLower(redirectDomain))
+		
+		// Parse the Location URL and check if host matches the redirect domain
+		parsedURL, err := url.Parse(location)
+		if err != nil {
+			// If URL parsing fails, fall back to NOT VULNERABLE
+			if !vulnOnly {
+				outputMutex.Lock()
+				fmt.Println(formatNotVulnerable(noColor, modifiedURL))
+				outputMutex.Unlock()
+			}
+			resp.Body.Close()
+			continue
+		}
+		
+		// Check if the host matches or ends with the redirect domain
+		host := strings.ToLower(parsedURL.Host)
+		redirectDomainLower := strings.ToLower(redirectDomain)
+		
+		// Match if host equals domain or ends with .domain
+		hasRedirectDomain := host == redirectDomainLower || 
+			strings.HasSuffix(host, "."+redirectDomainLower)
 
 		// Close response body
 		resp.Body.Close()
