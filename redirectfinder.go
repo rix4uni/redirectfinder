@@ -38,6 +38,8 @@ func main() {
 	var noColor bool
 	var verbose bool
 	var redirectDomain string
+	var Domain bool
+	var onlyDomain bool
 
 	pflag.StringVarP(&payloadArg, "payload", "p", "", "Payload(s) to use: single (\"https://bing.com\"), comma-separated (\"https://bing.com, //bing.com\"), or file path (payloads.txt)")
 	pflag.StringVar(&redirectDomain, "redirect", "bing.com", "Domain to check for in Location header (default: bing.com)")
@@ -48,6 +50,8 @@ func main() {
 	pflag.BoolVar(&version, "version", false, "Print the version of the tool and exit")
 	pflag.BoolVar(&noColor, "nc", false, "Disable colored output")
 	pflag.BoolVar(&verbose, "verbose", false, "Show verbose output (download messages, etc.)")
+	pflag.BoolVar(&Domain, "domain", false, "Extract unique domains and append payloads to the end of the domain")
+	pflag.BoolVar(&onlyDomain, "only-domain", false, "Extract unique domains and append payloads to the end of the domain (domain mode only)")
 	pflag.Parse()
 
 	if version {
@@ -75,6 +79,41 @@ func main() {
 	// Replace bing.com with the specified redirect domain in all payloads
 	if redirectDomain != "bing.com" {
 		payloads = replaceDomainInPayloads(payloads, "bing.com", redirectDomain)
+	}
+
+	if Domain || onlyDomain {
+		inputLines, err := readInputLines()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(inputLines) == 0 {
+			return
+		}
+
+		if !onlyDomain {
+			urls, err := filterURLsWithPipelineFromInput(inputLines)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error filtering URLs: %v\n", err)
+				os.Exit(1)
+			}
+			if len(urls) > 0 {
+				processURLsConcurrently(urls, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor)
+			}
+		}
+
+		domains, err := extractDomainsWithSortUniqueFromInput(inputLines)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting domains: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(domains) > 0 {
+			processDomainsConcurrently(domains, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor)
+		}
+
+		return
 	}
 
 	// Filter URLs using the command pipeline: urldedupe -s | grep -aE '=|%3D' | egrep -aiv '.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|icon|pdf|svg|txt|js)'
@@ -215,11 +254,23 @@ func downloadPayloads(targetPath string) error {
 }
 
 func filterURLsWithPipeline() ([]string, error) {
+	return filterURLsWithPipelineFromReader(os.Stdin)
+}
+
+func filterURLsWithPipelineFromInput(lines []string) ([]string, error) {
+	input := strings.Join(lines, "\n")
+	if input != "" {
+		input += "\n"
+	}
+	return filterURLsWithPipelineFromReader(strings.NewReader(input))
+}
+
+func filterURLsWithPipelineFromReader(reader io.Reader) ([]string, error) {
 	// Execute the command pipeline: urldedupe -s | grep -aE '=|%3D' | egrep -aiv '.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|icon|pdf|svg|txt|js)'
 	cmd := exec.Command("sh", "-c", "urldedupe -s | grep -aE '=|%3D' | egrep -aiv '\\.(jpg|jpeg|gif|css|tif|tiff|png|ttf|woff|woff2|icon|pdf|svg|txt|js)'")
 
 	// Set stdin to the current process stdin
-	cmd.Stdin = os.Stdin
+	cmd.Stdin = reader
 
 	// Capture stdout
 	stdout, err := cmd.StdoutPipe()
@@ -263,6 +314,111 @@ func filterURLsWithPipeline() ([]string, error) {
 	}
 
 	return urls, nil
+}
+
+func extractDomainsWithSortUnique() ([]string, error) {
+	return extractDomainsWithSortUniqueFromReader(os.Stdin)
+}
+
+func extractDomainsWithSortUniqueFromInput(lines []string) ([]string, error) {
+	input := strings.Join(lines, "\n")
+	if input != "" {
+		input += "\n"
+	}
+	return extractDomainsWithSortUniqueFromReader(strings.NewReader(input))
+}
+
+func extractDomainsWithSortUniqueFromReader(reader io.Reader) ([]string, error) {
+	sortCmd := exec.Command("sort", "-u")
+	sortStdin, err := sortCmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sort stdin pipe: %w", err)
+	}
+	sortStdout, err := sortCmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sort stdout pipe: %w", err)
+	}
+	sortCmd.Stderr = os.Stderr
+
+	if err := sortCmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start sort: %w", err)
+	}
+
+	writer := bufio.NewWriter(sortStdin)
+	stdinScanner := bufio.NewScanner(reader)
+	for stdinScanner.Scan() {
+		line := strings.TrimSpace(stdinScanner.Text())
+		if line == "" {
+			continue
+		}
+		parsedURL, err := url.Parse(line)
+		if err != nil {
+			continue
+		}
+		scheme := strings.ToLower(parsedURL.Scheme)
+		if scheme != "http" && scheme != "https" {
+			continue
+		}
+		if parsedURL.Host == "" {
+			continue
+		}
+		domain := parsedURL.Scheme + "://" + parsedURL.Host
+		if _, err := writer.WriteString(domain + "\n"); err != nil {
+			sortStdin.Close()
+			return nil, fmt.Errorf("failed to write to sort stdin: %w", err)
+		}
+	}
+	if err := stdinScanner.Err(); err != nil {
+		sortStdin.Close()
+		return nil, fmt.Errorf("failed to read stdin: %w", err)
+	}
+
+	if err := writer.Flush(); err != nil {
+		sortStdin.Close()
+		return nil, fmt.Errorf("failed to flush sort stdin: %w", err)
+	}
+	if err := sortStdin.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close sort stdin: %w", err)
+	}
+
+	var domains []string
+	stdoutScanner := bufio.NewScanner(sortStdout)
+	for stdoutScanner.Scan() {
+		line := strings.TrimSpace(stdoutScanner.Text())
+		if line != "" {
+			domains = append(domains, line)
+		}
+	}
+	if err := stdoutScanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read sort output: %w", err)
+	}
+
+	if err := sortCmd.Wait(); err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			if exitError.ExitCode() != 1 {
+				return nil, fmt.Errorf("sort failed: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("sort failed: %w", err)
+		}
+	}
+
+	return domains, nil
+}
+
+func readInputLines() ([]string, error) {
+	var lines []string
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
 }
 
 func loadPayloads(filename string) ([]string, error) {
@@ -319,6 +475,37 @@ func processURLsConcurrently(urls []string, payloads []string, redirectDomain st
 	wg.Wait()
 }
 
+func processDomainsConcurrently(domains []string, payloads []string, redirectDomain string, timeout int, concurrent int, vulnOnly bool, noColor bool) {
+	// Create a channel for domains
+	domainChan := make(chan string, len(domains))
+
+	// Create a WaitGroup to wait for all goroutines
+	var wg sync.WaitGroup
+
+	// Mutex for thread-safe output
+	var outputMutex sync.Mutex
+
+	// Start worker goroutines
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for domain := range domainChan {
+				testDomainPayloadURL(domain, payloads, redirectDomain, time.Duration(timeout)*time.Second, vulnOnly, noColor, &outputMutex)
+			}
+		}()
+	}
+
+	// Send domains to channel
+	for _, domain := range domains {
+		domainChan <- domain
+	}
+	close(domainChan)
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+}
+
 func formatVulnerable(noColor bool, url string) string {
 	if noColor {
 		return fmt.Sprintf("VULNERABLE: %s", url)
@@ -357,10 +544,8 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 			return "=" + payload
 		})
 
-		// Make HTTP GET request
-		resp, err := client.Get(modifiedURL)
+		isVulnerable, err := checkRedirect(modifiedURL, redirectDomain, client)
 		if err != nil {
-			// Skip on error, but still show NOT VULNERABLE if vulnOnly is false
 			if !vulnOnly {
 				outputMutex.Lock()
 				fmt.Println(formatNotVulnerable(noColor, modifiedURL))
@@ -369,49 +554,78 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 			continue
 		}
 
-		// Check if response status code is 3xx (redirect)
-		isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
-
-		// Get Location header
-		location := resp.Header.Get("Location")
-		
-		// Parse the Location URL and check if host matches the redirect domain
-		parsedURL, err := url.Parse(location)
-		if err != nil {
-			// If URL parsing fails, fall back to NOT VULNERABLE
-			if !vulnOnly {
-				outputMutex.Lock()
-				fmt.Println(formatNotVulnerable(noColor, modifiedURL))
-				outputMutex.Unlock()
-			}
-			resp.Body.Close()
-			continue
-		}
-		
-		// Check if the host matches or ends with the redirect domain
-		host := strings.ToLower(parsedURL.Host)
-		redirectDomainLower := strings.ToLower(redirectDomain)
-		
-		// Match if host equals domain or ends with .domain
-		hasRedirectDomain := host == redirectDomainLower || 
-			strings.HasSuffix(host, "."+redirectDomainLower)
-
-		// Close response body
-		resp.Body.Close()
-
-		// Check if both conditions are true: 3xx status and Location contains specified domain
-		if isRedirect && hasRedirectDomain {
+		if isVulnerable {
 			outputMutex.Lock()
 			fmt.Println(formatVulnerable(noColor, modifiedURL))
 			outputMutex.Unlock()
-			return // Found vulnerability, stop testing this URL
-		} else {
-			// No vulnerability found, show NOT VULNERABLE if vulnOnly is false
+			return
+		}
+
+		if !vulnOnly {
+			outputMutex.Lock()
+			fmt.Println(formatNotVulnerable(noColor, modifiedURL))
+			outputMutex.Unlock()
+		}
+	}
+}
+
+func testDomainPayloadURL(domain string, payloads []string, redirectDomain string, timeout time.Duration, vulnOnly bool, noColor bool, outputMutex *sync.Mutex) {
+	client := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	for _, payload := range payloads {
+		modifiedURL := domain + payload
+
+		isVulnerable, err := checkRedirect(modifiedURL, redirectDomain, client)
+		if err != nil {
 			if !vulnOnly {
 				outputMutex.Lock()
 				fmt.Println(formatNotVulnerable(noColor, modifiedURL))
 				outputMutex.Unlock()
 			}
+			continue
+		}
+
+		if isVulnerable {
+			outputMutex.Lock()
+			fmt.Println(formatVulnerable(noColor, modifiedURL))
+			outputMutex.Unlock()
+			return
+		}
+
+		if !vulnOnly {
+			outputMutex.Lock()
+			fmt.Println(formatNotVulnerable(noColor, modifiedURL))
+			outputMutex.Unlock()
 		}
 	}
+}
+
+func checkRedirect(targetURL string, redirectDomain string, client *http.Client) (bool, error) {
+	resp, err := client.Get(targetURL)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
+	if !isRedirect {
+		return false, nil
+	}
+
+	location := resp.Header.Get("Location")
+	parsedURL, err := url.Parse(location)
+	if err != nil {
+		return false, nil
+	}
+
+	host := strings.ToLower(parsedURL.Host)
+	redirectDomainLower := strings.ToLower(redirectDomain)
+	hasRedirectDomain := host == redirectDomainLower || strings.HasSuffix(host, "."+redirectDomainLower)
+
+	return hasRedirectDomain, nil
 }

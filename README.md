@@ -9,6 +9,7 @@ A fast and efficient Open Redirect vulnerability scanner written in Go. This too
 - 🎨 **Colored Output**: Color-coded results (Red for VULNERABLE, Green for NOT VULNERABLE)
 - 📦 **Auto-Download Payloads**: Automatically downloads default redirect payloads on first run
 - 🔄 **URL Filtering**: Automatically filters URLs using `urldedupe`, `grep`, and `egrep`
+- 🧭 **Domain Payload Mode**: Extract unique domains and append payloads to the end of the domain using `sort -u`
 - 🌐 **URL-Encoded Support**: Handles both `=` and `%3D` (URL-encoded equals) in parameters
 - ⚡ **Configurable**: Customizable timeout, concurrency, and output options
 - 📝 **Flexible Payloads**: Use single payload, comma-separated payloads, or payload file
@@ -28,9 +29,9 @@ go install github.com/rix4uni/redirectfinder@latest
 
 ### Download Prebuilt Binaries
 ```
-wget https://github.com/rix4uni/redirectfinder/releases/download/v0.0.2/redirectfinder-linux-amd64-0.0.2.tgz
-tar -xvzf redirectfinder-linux-amd64-0.0.2.tgz
-rm -rf redirectfinder-linux-amd64-0.0.2.tgz
+wget https://github.com/rix4uni/redirectfinder/releases/download/v0.0.3/redirectfinder-linux-amd64-0.0.3.tgz
+tar -xvzf redirectfinder-linux-amd64-0.0.3.tgz
+rm -rf redirectfinder-linux-amd64-0.0.3.tgz
 mv redirectfinder ~/go/bin/redirectfinder
 ```
 
@@ -61,6 +62,15 @@ cat urls.txt | redirectfinder -p "https://bing.com, //bing.com"
 
 # With custom payloads file
 cat urls.txt | redirectfinder -p payloads.txt
+
+# Extract unique domains and append payloads to the domain
+cat urls.txt | redirectfinder --domain
+
+# Domain-only payload scanning (no parameter rewriting)
+cat urls.txt | redirectfinder --only-domain
+
+# Domain-only payload scanning with a single domain
+echo "https://admin.dell.com" | redirectfinder --only-domain
 ```
 
 ### Command-Line Flags
@@ -76,6 +86,8 @@ cat urls.txt | redirectfinder -p payloads.txt
 | `--version` | | Print version and exit | `false` |
 | `--nc` | | Disable colored output | `false` |
 | `--verbose` | | Show verbose output (download messages, etc.) | `false` |
+| `--domain` | | Extract unique domains and append payloads to the end of the domain | `false` |
+| `--only-domain` | | Extract unique domains and append payloads to the end of the domain (domain mode only) | `false` |
 
 ### Examples
 
@@ -117,6 +129,16 @@ cat urls.txt | redirectfinder -p /path/to/custom-payloads.txt
 #### Verbose mode (shows download messages)
 ```yaml
 cat urls.txt | redirectfinder --verbose
+```
+
+#### Domain payload mode (unique domains)
+```yaml
+cat urls.txt | redirectfinder --domain
+```
+
+#### Domain-only payload mode
+```yaml
+cat urls.txt | redirectfinder --only-domain
 ```
 
 #### Custom redirect domain
@@ -186,6 +208,22 @@ The tool supports both standard and URL-encoded parameter separators:
 - URL-encoded: `?redirect%3Dvalue`
 
 Both formats are automatically detected and tested.
+
+## Domain Payload Mode
+
+There are two domain payload modes:
+
+- `--domain`: runs parameter rewriting first, then runs domain payload scanning.
+- `--only-domain`: runs only the domain payload scanning (no parameter rewriting). If both flags are set, `--only-domain` takes precedence.
+
+Domain payload scanning works as follows:
+
+1. **Domain Extraction**: Reads URLs from stdin, extracts only http/https domains, and deduplicates them using:
+   ```yaml
+   sort -u
+   ```
+2. **Payload Testing**: For each unique domain, appends each payload directly to the end of the domain and sends the request.
+3. **Vulnerability Detection**: Uses the same redirect rules and `--redirect` domain matching as the parameter mode.
 
 ## Vulnerability Detection
 
