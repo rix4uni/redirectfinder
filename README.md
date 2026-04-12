@@ -13,6 +13,7 @@ A fast and efficient Open Redirect vulnerability scanner written in Go. This too
 - 🌐 **URL-Encoded Support**: Handles both `=` and `%3D` (URL-encoded equals) in parameters
 - ⚡ **Configurable**: Customizable timeout, concurrency, and output options
 - 📝 **Flexible Payloads**: Use single payload, comma-separated payloads, or payload file
+- ♻️ **Crash-Safe Resume**: Default-on resume with `resume.cfg`; use `--no-resume` to start fresh
 
 ## Installation
 
@@ -29,9 +30,9 @@ go install github.com/rix4uni/redirectfinder@latest
 
 ### Download Prebuilt Binaries
 ```
-wget https://github.com/rix4uni/redirectfinder/releases/download/v0.0.3/redirectfinder-linux-amd64-0.0.3.tgz
-tar -xvzf redirectfinder-linux-amd64-0.0.3.tgz
-rm -rf redirectfinder-linux-amd64-0.0.3.tgz
+wget https://github.com/rix4uni/redirectfinder/releases/download/v0.0.4/redirectfinder-linux-amd64-0.0.4.tgz
+tar -xvzf redirectfinder-linux-amd64-0.0.4.tgz
+rm -rf redirectfinder-linux-amd64-0.0.4.tgz
 mv redirectfinder ~/go/bin/redirectfinder
 ```
 
@@ -88,6 +89,7 @@ echo "https://admin.dell.com" | redirectfinder --only-domain
 | `--verbose` | | Show verbose output (download messages, etc.) | `false` |
 | `--domain` | | Extract unique domains and append payloads to the end of the domain | `false` |
 | `--only-domain` | | Extract unique domains and append payloads to the end of the domain (domain mode only) | `false` |
+| `--no-resume` | | Disable resume; start scanning fresh and ignore any existing `resume.cfg` | `false` |
 
 ### Examples
 
@@ -99,6 +101,11 @@ cat urls.txt | redirectfinder
 #### Test with custom timeout and concurrency
 ```yaml
 cat urls.txt | redirectfinder --timeout 60 --concurrent 100
+```
+
+#### Start fresh without resuming
+```yaml
+cat urls.txt | redirectfinder --no-resume
 ```
 
 #### Show only vulnerable URLs
@@ -243,4 +250,29 @@ cat urls.txt | redirectfinder --redirect google.com
 - **Concurrent Processing**: By default, processes 50 URLs concurrently
 - **Configurable Concurrency**: Adjust with `--concurrent` flag
 - **Timeout Control**: Configurable HTTP timeout with `--timeout` flag
+
+## Resume Functionality
+
+When scanning from a list (stdin), resume is enabled by default. Progress is saved after each host to a `resume.cfg` file in the current directory in statistics format:
+
+```
+scanned=300000
+```
+
+If a scan is interrupted (e.g., CTRL+C, terminal closed, system restart), re-run the same command in the same directory to automatically resume. The scanner skips the first `scanned` items from the post-filtered input stream and continues.
+
+- To start fresh, use `--no-resume`.
+- On successful completion, `resume.cfg` is deleted automatically.
+
+The resume counter is defined over the post-filtered stream (after `urldedupe`/`grep`/`sort`), so resuming requires running the same command again to reproduce the same filtered order.
+
+## Interrupt Handling
+
+The scanner responds immediately to the first CTRL+C:
+
+- Pending tasks are cancelled gracefully
+- Resume statistics are saved before exiting
+- A helpful message is printed indicating how to resume
+
+To resume an interrupted scan, simply run the same command again in the same directory. The scanner will continue from where it left off. The resume file is automatically deleted after successful completion.
 

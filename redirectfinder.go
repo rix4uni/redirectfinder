@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +43,7 @@ func main() {
 	var redirectDomain string
 	var Domain bool
 	var onlyDomain bool
+	var noResume bool
 
 	pflag.StringVarP(&payloadArg, "payload", "p", "", "Payload(s) to use: single (\"https://bing.com\"), comma-separated (\"https://bing.com, //bing.com\"), or file path (payloads.txt)")
 	pflag.StringVar(&redirectDomain, "redirect", "bing.com", "Domain to check for in Location header (default: bing.com)")
@@ -52,6 +56,7 @@ func main() {
 	pflag.BoolVar(&verbose, "verbose", false, "Show verbose output (download messages, etc.)")
 	pflag.BoolVar(&Domain, "domain", false, "Extract unique domains and append payloads to the end of the domain")
 	pflag.BoolVar(&onlyDomain, "only-domain", false, "Extract unique domains and append payloads to the end of the domain (domain mode only)")
+	pflag.BoolVar(&noResume, "no-resume", false, "Disable resume functionality and start scanning fresh")
 	pflag.Parse()
 
 	if version {
@@ -81,6 +86,41 @@ func main() {
 		payloads = replaceDomainInPayloads(payloads, "bing.com", redirectDomain)
 	}
 
+	// Resume state setup
+	cwd, _ := os.Getwd()
+	resumePath := filepath.Join(cwd, "resume.cfg")
+	start := 0
+	if noResume {
+		_ = deleteResume(resumePath)
+		if !silent {
+			fmt.Fprintln(os.Stderr, "Starting fresh; resume disabled (--no-resume)")
+		}
+	} else {
+		s, _ := loadResume(resumePath)
+		start = s
+		if start > 0 && !silent {
+			fmt.Fprintf(os.Stderr, "Resuming from scanned=%d (skipping %d items)\n", start, start)
+		}
+	}
+
+	// Context and interrupt handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	interrupted := false
+	go func() {
+		<-sigCh
+		interrupted = true
+		fmt.Fprintln(os.Stderr, "\nInterrupt received. Cancelling pending tasks and saving progress...")
+		cancel()
+	}()
+
+	// Ensure resume file exists immediately when resume is enabled
+	if !noResume {
+		_ = saveResume(resumePath, start)
+	}
+
 	if Domain || onlyDomain {
 		inputLines, err := readInputLines()
 		if err != nil {
@@ -92,14 +132,12 @@ func main() {
 			return
 		}
 
+		urls := []string{}
 		if !onlyDomain {
-			urls, err := filterURLsWithPipelineFromInput(inputLines)
+			urls, err = filterURLsWithPipelineFromInput(inputLines)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error filtering URLs: %v\n", err)
 				os.Exit(1)
-			}
-			if len(urls) > 0 {
-				processURLsConcurrently(urls, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor)
 			}
 		}
 
@@ -109,10 +147,50 @@ func main() {
 			os.Exit(1)
 		}
 
-		if len(domains) > 0 {
-			processDomainsConcurrently(domains, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor)
+		total := len(urls) + len(domains)
+		if !noResume && start >= total {
+			if !silent {
+				fmt.Fprintln(os.Stderr, "Nothing to do; all items already scanned. Use --no-resume to start over.")
+			}
+			_ = deleteResume(resumePath)
+			return
 		}
 
+		if len(urls) > 0 && !onlyDomain {
+			startURLs := start
+			if startURLs > len(urls) {
+				startURLs = len(urls)
+			}
+			if startURLs < len(urls) {
+				_, nextGlobal := processURLsConcurrently(ctx, urls, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor, resumePath, 0, startURLs)
+				start = nextGlobal
+			} else {
+				start = startURLs
+			}
+		}
+
+		if len(domains) > 0 {
+			base := len(urls)
+			startDomains := start - base
+			if startDomains < 0 {
+				startDomains = 0
+			}
+			if startDomains < len(domains) {
+				completedAll, nextGlobal := processDomainsConcurrently(ctx, domains, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor, resumePath, base, startDomains)
+				start = nextGlobal
+				if completedAll && !interrupted {
+					_ = deleteResume(resumePath)
+				}
+			}
+		} else {
+			if !interrupted {
+				_ = deleteResume(resumePath)
+			}
+		}
+
+		if interrupted {
+			fmt.Fprintln(os.Stderr, "Progress saved to resume.cfg. Re-run the same command to resume, or use --no-resume to start over.")
+		}
 		return
 	}
 
@@ -127,8 +205,22 @@ func main() {
 		return
 	}
 
-	// Process URLs concurrently
-	processURLsConcurrently(urls, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor)
+	total := len(urls)
+	if !noResume && start >= total {
+		if !silent {
+			fmt.Fprintln(os.Stderr, "Nothing to do; all items already scanned. Use --no-resume to start over.")
+		}
+		_ = deleteResume(resumePath)
+		return
+	}
+
+	_, nextGlobal := processURLsConcurrently(ctx, urls, payloads, redirectDomain, timeout, concurrent, vulnOnly, noColor, resumePath, 0, start)
+	if nextGlobal >= total && !interrupted {
+		_ = deleteResume(resumePath)
+	}
+	if interrupted {
+		fmt.Fprintln(os.Stderr, "Progress saved to resume.cfg. Re-run the same command to resume, or use --no-resume to start over.")
+	}
 }
 
 func getHomeDir() (string, error) {
@@ -444,66 +536,157 @@ func loadPayloads(filename string) ([]string, error) {
 	return payloads, nil
 }
 
-func processURLsConcurrently(urls []string, payloads []string, redirectDomain string, timeout int, concurrent int, vulnOnly bool, noColor bool) {
-	// Create a channel for URLs
-	urlChan := make(chan string, len(urls))
-
-	// Create a WaitGroup to wait for all goroutines
-	var wg sync.WaitGroup
-
-	// Mutex for thread-safe output
-	var outputMutex sync.Mutex
-
-	// Start worker goroutines
-	for i := 0; i < concurrent; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for urlStr := range urlChan {
-				testURL(urlStr, payloads, redirectDomain, time.Duration(timeout)*time.Second, vulnOnly, noColor, &outputMutex)
-			}
-		}()
-	}
-
-	// Send URLs to channel
-	for _, urlStr := range urls {
-		urlChan <- urlStr
-	}
-	close(urlChan)
-
-	// Wait for all goroutines to complete
-	wg.Wait()
+type workItem struct {
+	index int
+	value string
 }
 
-func processDomainsConcurrently(domains []string, payloads []string, redirectDomain string, timeout int, concurrent int, vulnOnly bool, noColor bool) {
-	// Create a channel for domains
-	domainChan := make(chan string, len(domains))
+func processURLsConcurrently(ctx context.Context, urls []string, payloads []string, redirectDomain string, timeout int, concurrent int, vulnOnly bool, noColor bool, resumePath string, base int, startLocal int) (bool, int) {
+	if startLocal >= len(urls) {
+		return true, base + startLocal
+	}
 
-	// Create a WaitGroup to wait for all goroutines
+	workCh := make(chan workItem, concurrent)
+	doneCh := make(chan int, concurrent*2)
 	var wg sync.WaitGroup
-
-	// Mutex for thread-safe output
 	var outputMutex sync.Mutex
 
-	// Start worker goroutines
 	for i := 0; i < concurrent; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for domain := range domainChan {
-				testDomainPayloadURL(domain, payloads, redirectDomain, time.Duration(timeout)*time.Second, vulnOnly, noColor, &outputMutex)
+			for wi := range workCh {
+				if ctx.Err() != nil {
+					return
+				}
+				completed := testURL(ctx, wi.value, payloads, redirectDomain, time.Duration(timeout)*time.Second, vulnOnly, noColor, &outputMutex)
+				if completed {
+					select {
+					case doneCh <- wi.index:
+					case <-ctx.Done():
+						return
+					}
+				}
 			}
 		}()
 	}
 
-	// Send domains to channel
-	for _, domain := range domains {
-		domainChan <- domain
-	}
-	close(domainChan)
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		for i := startLocal; i < len(urls); i++ {
+			if ctx.Err() != nil {
+				break
+			}
+			wi := workItem{index: i, value: urls[i]}
+			select {
+			case workCh <- wi:
+			case <-ctx.Done():
+				return
+			}
+		}
+		close(workCh)
+	}()
 
-	// Wait for all goroutines to complete
+	nextLocal := startLocal
+	pending := make(map[int]struct{})
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		for idx := range doneCh {
+			pending[idx] = struct{}{}
+			for {
+				if _, ok := pending[nextLocal]; ok {
+					delete(pending, nextLocal)
+					nextLocal++
+					_ = saveResume(resumePath, base+nextLocal)
+				} else {
+					break
+				}
+			}
+		}
+	}()
+
 	wg.Wait()
+	close(doneCh)
+	<-collectorDone
+
+	completedAll := nextLocal >= len(urls)
+	return completedAll, base + nextLocal
+}
+
+func processDomainsConcurrently(ctx context.Context, domains []string, payloads []string, redirectDomain string, timeout int, concurrent int, vulnOnly bool, noColor bool, resumePath string, base int, startLocal int) (bool, int) {
+	if startLocal >= len(domains) {
+		return true, base + startLocal
+	}
+
+	workCh := make(chan workItem, concurrent)
+	doneCh := make(chan int, concurrent*2)
+	var wg sync.WaitGroup
+	var outputMutex sync.Mutex
+
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for wi := range workCh {
+				if ctx.Err() != nil {
+					return
+				}
+				completed := testDomainPayloadURL(ctx, wi.value, payloads, redirectDomain, time.Duration(timeout)*time.Second, vulnOnly, noColor, &outputMutex)
+				if completed {
+					select {
+					case doneCh <- wi.index:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		for i := startLocal; i < len(domains); i++ {
+			if ctx.Err() != nil {
+				break
+			}
+			wi := workItem{index: i, value: domains[i]}
+			select {
+			case workCh <- wi:
+			case <-ctx.Done():
+				return
+			}
+		}
+		close(workCh)
+	}()
+
+	nextLocal := startLocal
+	pending := make(map[int]struct{})
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		for idx := range doneCh {
+			pending[idx] = struct{}{}
+			for {
+				if _, ok := pending[nextLocal]; ok {
+					delete(pending, nextLocal)
+					nextLocal++
+					_ = saveResume(resumePath, base+nextLocal)
+				} else {
+					break
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(doneCh)
+	<-collectorDone
+
+	completedAll := nextLocal >= len(domains)
+	return completedAll, base + nextLocal
 }
 
 func formatVulnerable(noColor bool, url string) string {
@@ -520,7 +703,7 @@ func formatNotVulnerable(noColor bool, url string) string {
 	return fmt.Sprintf("%sNOT VULNERABLE: %s %s", colorGreen, url, colorReset)
 }
 
-func testURL(urlStr string, payloads []string, redirectDomain string, timeout time.Duration, vulnOnly bool, noColor bool, outputMutex *sync.Mutex) {
+func testURL(ctx context.Context, urlStr string, payloads []string, redirectDomain string, timeout time.Duration, vulnOnly bool, noColor bool, outputMutex *sync.Mutex) bool {
 	// Create HTTP client with configurable timeout and disable redirect following
 	client := &http.Client{
 		Timeout: timeout,
@@ -534,6 +717,9 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 	reValue := regexp.MustCompile(`(?:=|%3D)[^&\s]*`)
 
 	for _, payload := range payloads {
+		if ctx.Err() != nil {
+			return false
+		}
 		// Replace all parameter values with the payload using regex
 		// Use a function to preserve the original separator (= or %3D)
 		modifiedURL := reValue.ReplaceAllStringFunc(urlStr, func(match string) string {
@@ -544,8 +730,11 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 			return "=" + payload
 		})
 
-		isVulnerable, err := checkRedirect(modifiedURL, redirectDomain, client)
+		isVulnerable, err := checkRedirect(ctx, modifiedURL, redirectDomain, client)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			if !vulnOnly {
 				outputMutex.Lock()
 				fmt.Println(formatNotVulnerable(noColor, modifiedURL))
@@ -558,7 +747,7 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 			outputMutex.Lock()
 			fmt.Println(formatVulnerable(noColor, modifiedURL))
 			outputMutex.Unlock()
-			return
+			return true
 		}
 
 		if !vulnOnly {
@@ -567,9 +756,10 @@ func testURL(urlStr string, payloads []string, redirectDomain string, timeout ti
 			outputMutex.Unlock()
 		}
 	}
+	return true
 }
 
-func testDomainPayloadURL(domain string, payloads []string, redirectDomain string, timeout time.Duration, vulnOnly bool, noColor bool, outputMutex *sync.Mutex) {
+func testDomainPayloadURL(ctx context.Context, domain string, payloads []string, redirectDomain string, timeout time.Duration, vulnOnly bool, noColor bool, outputMutex *sync.Mutex) bool {
 	client := &http.Client{
 		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -578,10 +768,16 @@ func testDomainPayloadURL(domain string, payloads []string, redirectDomain strin
 	}
 
 	for _, payload := range payloads {
+		if ctx.Err() != nil {
+			return false
+		}
 		modifiedURL := domain + payload
 
-		isVulnerable, err := checkRedirect(modifiedURL, redirectDomain, client)
+		isVulnerable, err := checkRedirect(ctx, modifiedURL, redirectDomain, client)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			if !vulnOnly {
 				outputMutex.Lock()
 				fmt.Println(formatNotVulnerable(noColor, modifiedURL))
@@ -594,7 +790,7 @@ func testDomainPayloadURL(domain string, payloads []string, redirectDomain strin
 			outputMutex.Lock()
 			fmt.Println(formatVulnerable(noColor, modifiedURL))
 			outputMutex.Unlock()
-			return
+			return true
 		}
 
 		if !vulnOnly {
@@ -603,10 +799,15 @@ func testDomainPayloadURL(domain string, payloads []string, redirectDomain strin
 			outputMutex.Unlock()
 		}
 	}
+	return true
 }
 
-func checkRedirect(targetURL string, redirectDomain string, client *http.Client) (bool, error) {
-	resp, err := client.Get(targetURL)
+func checkRedirect(ctx context.Context, targetURL string, redirectDomain string, client *http.Client) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -628,4 +829,50 @@ func checkRedirect(targetURL string, redirectDomain string, client *http.Client)
 	hasRedirectDomain := host == redirectDomainLower || strings.HasSuffix(host, "."+redirectDomainLower)
 
 	return hasRedirectDomain, nil
+}
+
+func loadResume(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "scanned=") {
+			val := strings.TrimPrefix(line, "scanned=")
+			n, err := strconv.Atoi(strings.TrimSpace(val))
+			if err == nil && n >= 0 {
+				return n, nil
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+func saveResume(path string, scanned int) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	data := []byte(fmt.Sprintf("scanned=%d\n", scanned))
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		_ = os.Remove(path)
+	}
+	return os.Rename(tmp, path)
+}
+
+func deleteResume(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return os.Remove(path)
+	}
+	return nil
 }
