@@ -30,9 +30,9 @@ go install github.com/rix4uni/redirectfinder@latest
 
 ### Download Prebuilt Binaries
 ```
-wget https://github.com/rix4uni/redirectfinder/releases/download/v0.0.4/redirectfinder-linux-amd64-0.0.4.tgz
-tar -xvzf redirectfinder-linux-amd64-0.0.4.tgz
-rm -rf redirectfinder-linux-amd64-0.0.4.tgz
+wget https://github.com/rix4uni/redirectfinder/releases/download/v0.0.5/redirectfinder-linux-amd64-0.0.5.tgz
+tar -xvzf redirectfinder-linux-amd64-0.0.5.tgz
+rm -rf redirectfinder-linux-amd64-0.0.5.tgz
 mv redirectfinder ~/go/bin/redirectfinder
 ```
 

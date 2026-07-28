@@ -5,7 +5,7 @@ import (
 )
 
 // prints the version message
-const version = "v0.0.4"
+const version = "v0.0.5"
 
 func PrintVersion() {
 	fmt.Printf("Current redirectfinder version %s\n", version)
@@ -22,4 +22,3 @@ func PrintBanner() {
 `
 	fmt.Printf("%s\n%65s\n\n", banner, "Current redirectfinder version "+version)
 }
-

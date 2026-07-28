@@ -824,8 +824,11 @@ func checkRedirect(ctx context.Context, targetURL string, redirectDomain string,
 		return false, nil
 	}
 
-	host := strings.ToLower(parsedURL.Host)
+	host := strings.ToLower(parsedURL.Hostname())
 	redirectDomainLower := strings.ToLower(redirectDomain)
+	if u, err := url.Parse("//" + redirectDomainLower); err == nil && u.Hostname() != "" {
+		redirectDomainLower = strings.ToLower(u.Hostname())
+	}
 	hasRedirectDomain := host == redirectDomainLower || strings.HasSuffix(host, "."+redirectDomainLower)
 
 	return hasRedirectDomain, nil
